@@ -1,5 +1,5 @@
 /* USER CODE BEGIN Header */
-// Monitor analogico con alarma - Etapa 2: ADC y telemetria basica
+// Monitor analogico con alarma - Etapa 3: ADC, histéresis y RUN/PAUSE
 // NUCLEO-F302R8, reloj del sistema a 64 MHz
 /* USER CODE END Header */
 
@@ -20,7 +20,15 @@ uint8_t porcentaje = 0;
 uint8_t muestra_valida = 0;
 uint8_t adc_en_curso = 0;
 
-char tx_linea[64];
+uint8_t modo_run = 1;
+uint8_t umbral = 70;
+uint8_t alarma = 0;
+
+uint8_t boton_raw = 1;
+uint8_t boton_estable = 1;
+uint32_t boton_cambio_ms = 0;
+
+char tx_linea[112];
 uint16_t tx_pos = 0;
 uint16_t tx_len = 0;
 /* USER CODE END PV */
@@ -31,6 +39,9 @@ static void MX_GPIO_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM6_Init(void);
 static void MX_USART2_UART_Init(void);
+static void ActualizarSalidaAlarma(void);
+static void EvaluarHisteresis(void);
+static void ReiniciarDecisionAlarma(void);
 
 int main(void)
 {
@@ -61,6 +72,10 @@ int main(void)
   uint32_t ultimo_led = tiempo_ms;
   uint32_t ultimo_adc = tiempo_ms;
   uint32_t ultimo_uart = tiempo_ms;
+
+  boton_raw = (HAL_GPIO_ReadPin(BOTON_USER_GPIO_Port, BOTON_USER_Pin) == GPIO_PIN_SET);
+  boton_estable = boton_raw;
+  boton_cambio_ms = tiempo_ms;
   /* USER CODE END 2 */
 
   while (1)
@@ -68,10 +83,28 @@ int main(void)
     /* USER CODE BEGIN 3 */
     uint32_t ahora = tiempo_ms;
 
+    // El boton usa polling y exige estabilidad durante 30 ms.
+    uint8_t lectura_boton = (HAL_GPIO_ReadPin(BOTON_USER_GPIO_Port,
+                                             BOTON_USER_Pin) == GPIO_PIN_SET);
+    if (lectura_boton != boton_raw)
+    {
+      boton_raw = lectura_boton;
+      boton_cambio_ms = ahora;
+    }
+    if (boton_raw != boton_estable && (uint32_t)(ahora - boton_cambio_ms) >= 30U)
+    {
+      boton_estable = boton_raw;
+      if (boton_estable == 0U)
+      {
+        modo_run = !modo_run;
+        ReiniciarDecisionAlarma();
+      }
+    }
+
     if ((uint32_t)(ahora - ultimo_led) >= 500U)
     {
       ultimo_led += 500U;
-      HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_13);
+      HAL_GPIO_TogglePin(LED_ACTIVIDAD_GPIO_Port, LED_ACTIVIDAD_Pin);
     }
 
     if ((uint32_t)(ahora - ultimo_adc) >= 100U)
@@ -83,7 +116,6 @@ int main(void)
       }
     }
 
-    // La conversion se comprueba sin detener las demas tareas.
     if (adc_en_curso && __HAL_ADC_GET_FLAG(&hadc1, ADC_FLAG_EOC))
     {
       adc_bruto = (uint16_t)HAL_ADC_GetValue(&hadc1);
@@ -91,19 +123,22 @@ int main(void)
       muestra_valida = 1;
       adc_en_curso = 0;
       HAL_ADC_Stop(&hadc1);
+      EvaluarHisteresis();
     }
 
-    // En esta etapa mostramos una linea de diagnostico cada segundo.
     if ((uint32_t)(ahora - ultimo_uart) >= 1000U)
     {
       ultimo_uart += 1000U;
       if (muestra_valida && tx_pos == tx_len)
       {
         int n = snprintf(tx_linea, sizeof(tx_linea),
-                         "t=%lu;ADC=%u;PCT=%u\r\n",
+                         "t=%lu;ADC=%u;PCT=%u;THR=%u;MODE=%s;ALARM=%u\r\n",
                          (unsigned long)ahora,
                          (unsigned int)adc_bruto,
-                         (unsigned int)porcentaje);
+                         (unsigned int)porcentaje,
+                         (unsigned int)umbral,
+                         modo_run ? "RUN" : "PAUSE",
+                         (unsigned int)alarma);
         if (n > 0 && n < (int)sizeof(tx_linea))
         {
           tx_pos = 0;
@@ -112,7 +147,7 @@ int main(void)
       }
     }
 
-    // Transmite a razon de un caracter cuando UART esta disponible.
+    // Se transmite un caracter por iteracion, sin retardos bloqueantes.
     if (tx_pos < tx_len && __HAL_UART_GET_FLAG(&huart2, UART_FLAG_TXE))
     {
       huart2.Instance->TDR = (uint8_t)tx_linea[tx_pos++];
@@ -263,14 +298,44 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pin = GPIO_PIN_13;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  // PC13: pulsador USER; la lectura se implementara mas adelante.
+  // PC13: pulsador activo en bajo con pull-up.
   GPIO_InitStruct.Pin = GPIO_PIN_13;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 }
 
 /* USER CODE BEGIN 4 */
+static void ActualizarSalidaAlarma(void)
+{
+  HAL_GPIO_WritePin(LED_ALARMA_GPIO_Port, LED_ALARMA_Pin,
+                    alarma ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static void EvaluarHisteresis(void)
+{
+  if (!modo_run || !muestra_valida)
+  {
+    alarma = 0;
+  }
+  else if (porcentaje >= umbral)
+  {
+    alarma = 1;
+  }
+  else if (porcentaje < (uint8_t)(umbral - 5U))
+  {
+    alarma = 0;
+  }
+  ActualizarSalidaAlarma();
+}
+
+static void ReiniciarDecisionAlarma(void)
+{
+  // Al reanudar no se conserva el estado previo de la histeresis.
+  alarma = (modo_run && muestra_valida && porcentaje >= umbral) ? 1U : 0U;
+  ActualizarSalidaAlarma();
+}
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM6)
