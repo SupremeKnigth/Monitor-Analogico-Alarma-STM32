@@ -1,0 +1,14 @@
+# Archivos de compilación
+Debug/
+Release/
+
+# Configuración local del IDE
+.settings/
+
+# Archivos temporales
+*.launch
+*.log
+*.bak
+
+# Evidencias de la práctica anterior
+EVIDENCIA DE INVENTARIO RFID.mp4
