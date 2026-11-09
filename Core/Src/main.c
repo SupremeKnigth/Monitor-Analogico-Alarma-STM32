@@ -1,5 +1,5 @@
 /* USER CODE BEGIN Header */
-// Monitor analogico con alarma - Etapa 3: ADC, histéresis y RUN/PAUSE
+// Monitor analogico con alarma - Etapa 4: comandos UART
 // NUCLEO-F302R8, reloj del sistema a 64 MHz
 /* USER CODE END Header */
 
@@ -28,9 +28,21 @@ uint8_t boton_raw = 1;
 uint8_t boton_estable = 1;
 uint32_t boton_cambio_ms = 0;
 
-char tx_linea[112];
-uint16_t tx_pos = 0;
-uint16_t tx_len = 0;
+#define RX_MAX 32U
+#define TX_MAX 112U
+#define TX_COLA 8U
+
+char rx_linea[RX_MAX + 1U];
+uint8_t rx_len = 0;
+uint8_t rx_descartar = 0;
+uint8_t rx_cr = 0;
+
+char tx_cola[TX_COLA][TX_MAX];
+uint8_t tx_largo[TX_COLA] = {0};
+uint8_t tx_entrada = 0;
+uint8_t tx_salida = 0;
+uint8_t tx_cantidad = 0;
+uint8_t tx_pos = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes */
@@ -42,6 +54,11 @@ static void MX_USART2_UART_Init(void);
 static void ActualizarSalidaAlarma(void);
 static void EvaluarHisteresis(void);
 static void ReiniciarDecisionAlarma(void);
+static void EncolarTexto(const char *texto);
+static void EncolarEstado(uint32_t ahora);
+static void ProcesarComando(const char *linea);
+static void RecibirCaracter(uint8_t caracter);
+static void AtenderUART(void);
 
 int main(void)
 {
@@ -82,6 +99,7 @@ int main(void)
   {
     /* USER CODE BEGIN 3 */
     uint32_t ahora = tiempo_ms;
+    AtenderUART();
 
     // El boton usa polling y exige estabilidad durante 30 ms.
     uint8_t lectura_boton = (HAL_GPIO_ReadPin(BOTON_USER_GPIO_Port,
@@ -129,28 +147,19 @@ int main(void)
     if ((uint32_t)(ahora - ultimo_uart) >= 1000U)
     {
       ultimo_uart += 1000U;
-      if (muestra_valida && tx_pos == tx_len)
-      {
-        int n = snprintf(tx_linea, sizeof(tx_linea),
-                         "t=%lu;ADC=%u;PCT=%u;THR=%u;MODE=%s;ALARM=%u\r\n",
-                         (unsigned long)ahora,
-                         (unsigned int)adc_bruto,
-                         (unsigned int)porcentaje,
-                         (unsigned int)umbral,
-                         modo_run ? "RUN" : "PAUSE",
-                         (unsigned int)alarma);
-        if (n > 0 && n < (int)sizeof(tx_linea))
-        {
-          tx_pos = 0;
-          tx_len = (uint16_t)n;
-        }
-      }
+      EncolarEstado(ahora);
     }
 
-    // Se transmite un caracter por iteracion, sin retardos bloqueantes.
-    if (tx_pos < tx_len && __HAL_UART_GET_FLAG(&huart2, UART_FLAG_TXE))
+    // El envio trabaja por caracteres sin mezclar lineas.
+    if (tx_cantidad > 0U && __HAL_UART_GET_FLAG(&huart2, UART_FLAG_TXE))
     {
-      huart2.Instance->TDR = (uint8_t)tx_linea[tx_pos++];
+      huart2.Instance->TDR = (uint8_t)tx_cola[tx_salida][tx_pos++];
+      if (tx_pos >= tx_largo[tx_salida])
+      {
+        tx_pos = 0U;
+        tx_salida = (uint8_t)((tx_salida + 1U) % TX_COLA);
+        tx_cantidad--;
+      }
     }
     /* USER CODE END 3 */
   }
@@ -334,6 +343,166 @@ static void ReiniciarDecisionAlarma(void)
   // Al reanudar no se conserva el estado previo de la histeresis.
   alarma = (modo_run && muestra_valida && porcentaje >= umbral) ? 1U : 0U;
   ActualizarSalidaAlarma();
+}
+
+// La cola garantiza que cada respuesta tenga su propio CRLF.
+static void EncolarTexto(const char *texto)
+{
+  size_t n = strlen(texto);
+  if (n == 0U || n >= TX_MAX || tx_cantidad >= TX_COLA)
+  {
+    return;
+  }
+
+  memcpy(tx_cola[tx_entrada], texto, n);
+  tx_largo[tx_entrada] = (uint8_t)n;
+  tx_entrada = (uint8_t)((tx_entrada + 1U) % TX_COLA);
+  tx_cantidad++;
+}
+
+static void EncolarEstado(uint32_t ahora)
+{
+  char linea[TX_MAX];
+  int n = snprintf(linea, sizeof(linea),
+                   "t=%lu;ADC=%u;PCT=%u;THR=%u;MODE=%s;ALARM=%u\r\n",
+                   (unsigned long)ahora,
+                   (unsigned int)adc_bruto,
+                   (unsigned int)porcentaje,
+                   (unsigned int)umbral,
+                   modo_run ? "RUN" : "PAUSE",
+                   (unsigned int)alarma);
+  if (n > 0 && n < (int)sizeof(linea))
+  {
+    EncolarTexto(linea);
+  }
+}
+
+static void ProcesarComando(const char *linea)
+{
+  if (strcmp(linea, "STATUS") == 0)
+  {
+    EncolarEstado(tiempo_ms);
+  }
+  else if (strcmp(linea, "START") == 0)
+  {
+    if (!modo_run)
+    {
+      modo_run = 1U;
+      ReiniciarDecisionAlarma();
+    }
+    EncolarTexto("OK RUN\r\n");
+  }
+  else if (strcmp(linea, "STOP") == 0)
+  {
+    modo_run = 0U;
+    alarma = 0U;
+    ActualizarSalidaAlarma();
+    EncolarTexto("OK PAUSE\r\n");
+  }
+  else if (strncmp(linea, "THR ", 4U) == 0)
+  {
+    const char *p = linea + 4;
+    uint32_t valor = 0U;
+    if (*p == '\0')
+    {
+      EncolarTexto("ERR\r\n");
+      return;
+    }
+    while (*p != '\0')
+    {
+      if (*p < '0' || *p > '9')
+      {
+        EncolarTexto("ERR\r\n");
+        return;
+      }
+      valor = valor * 10U + (uint32_t)(*p - '0');
+      if (valor > 95U)
+      {
+        EncolarTexto("ERR\r\n");
+        return;
+      }
+      p++;
+    }
+    if (valor < 10U)
+    {
+      EncolarTexto("ERR\r\n");
+      return;
+    }
+    umbral = (uint8_t)valor;
+    if (modo_run)
+    {
+      ReiniciarDecisionAlarma();
+    }
+    else
+    {
+      alarma = 0U;
+      ActualizarSalidaAlarma();
+    }
+    char respuesta[24];
+    (void)snprintf(respuesta, sizeof(respuesta), "OK THR=%u\r\n", (unsigned int)umbral);
+    EncolarTexto(respuesta);
+  }
+  else
+  {
+    EncolarTexto("ERR\r\n");
+  }
+}
+
+static void RecibirCaracter(uint8_t caracter)
+{
+  if (caracter == '\n')
+  {
+    if (rx_descartar)
+    {
+      EncolarTexto("ERR\r\n");
+    }
+    else if (rx_len != 0U)
+    {
+      rx_linea[rx_len] = '\0';
+      ProcesarComando(rx_linea);
+    }
+    rx_len = 0U;
+    rx_cr = 0U;
+    rx_descartar = 0U;
+    return;
+  }
+
+  if (rx_descartar)
+  {
+    return;
+  }
+
+  // CR solo es valido como parte final de CRLF.
+  if (rx_cr)
+  {
+    rx_descartar = 1U;
+    return;
+  }
+  if (caracter == '\r')
+  {
+    rx_cr = 1U;
+    return;
+  }
+  if (caracter < 32U || caracter > 126U || rx_len >= RX_MAX)
+  {
+    rx_descartar = 1U;
+    return;
+  }
+  rx_linea[rx_len++] = (char)caracter;
+}
+
+static void AtenderUART(void)
+{
+  // Si se perdio un dato, descarta esa linea y recupera en LF.
+  if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_ORE))
+  {
+    __HAL_UART_CLEAR_OREFLAG(&huart2);
+    rx_descartar = 1U;
+  }
+  if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_RXNE))
+  {
+    RecibirCaracter((uint8_t)huart2.Instance->RDR);
+  }
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
